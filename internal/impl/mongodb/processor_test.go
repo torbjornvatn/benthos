@@ -2,6 +2,7 @@ package mongodb_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/nsf/jsondiff"
@@ -9,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 
 	"github.com/benthosdev/benthos/v4/internal/component/processor"
@@ -428,26 +430,28 @@ func testMongoDBProcessorFindOne(port string, t *testing.T) {
 		WTimeout: "100s",
 	}
 	conf.MongoDB.Operation = "find-one"
-	conf.MongoDB.FilterMap = "root.a = this.a"
 
 	mongoClient, err := c.Client()
 	require.NoError(t, err)
 	err = mongoClient.Connect(context.Background())
 	require.NoError(t, err)
 	collection := mongoClient.Database("TestDB").Collection("TestCollection")
-	_, err = collection.InsertOne(context.Background(), bson.M{"a": "foo", "b": "bar", "c": "baz", "answer_to_everything": 42})
+	res, err := collection.InsertOne(context.Background(), bson.M{"a": "foo", "b": "bar", "c": "baz", "answer_to_everything": 42, "some_date": bson.M{"$ts": "2024-01-01T00:00:00Z"}})
 	assert.NoError(t, err)
+
+	insertedID := res.InsertedID.(primitive.ObjectID).Hex()
 
 	mgr, err := manager.New(manager.NewResourceConfig())
 	require.NoError(t, err)
 
 	for _, tt := range []struct {
-		name        string
-		message     string
-		marshalMode client.JSONMarshalMode
-		collection  string
-		expected    string
-		expectedErr error
+		name              string
+		message           string
+		marshalMode       client.JSONMarshalMode
+		collection        string
+		overrideFilterMap string
+		expected          string
+		expectedErr       error
 	}{
 		{
 			name:        "canonical marshal mode",
@@ -467,9 +471,51 @@ func testMongoDBProcessorFindOne(port string, t *testing.T) {
 			expectedErr: mongo.ErrNoDocuments,
 		},
 		{
-			name:        "no documents found",
+			name:        `no documents found with "a" containing object id`,
 			message:     `{"a":{"$oid":"63a884ef4e11f389b8717cd6"}}`,
 			expectedErr: mongo.ErrNoDocuments,
+		},
+		{
+			name:              "found a document matching object id",
+			message:           fmt.Sprintf(`{"a": {"$oid":"%s"}}`, insertedID),
+			overrideFilterMap: `root."_id" = this.a`,
+			expected:          `{"a":"foo","b":"bar","c":"baz","answer_to_everything":42}`,
+		},
+		{
+			name:              "found a document using regex on a",
+			message:           `{}`,
+			overrideFilterMap: `root.a = {"$regex": "^.*oo$", "$options": "i"}`,
+			expected:          `{"a":"foo","b":"bar","c":"baz","answer_to_everything":42}`,
+		},
+		{
+			name:              "found a document using regex on b",
+			message:           `{}`,
+			overrideFilterMap: `root.b = {"$regex": "^bar$", "$options": "i"}`,
+			expected:          `{"a":"foo","b":"bar","c":"baz","answer_to_everything":42}`,
+		},
+		{
+			name:              "found a document using regex on c",
+			message:           `{}`,
+			overrideFilterMap: `root.c = {"$regex": "az", "$options": "i"}`,
+			expected:          `{"a":"foo","b":"bar","c":"baz","answer_to_everything":42}`,
+		},
+		{
+			name:              "no documents found using regex on numeric field",
+			message:           `{}`,
+			overrideFilterMap: `root."answer_to_everything" = {"$regex": "[0-9]+", "$options": "i"}`,
+			expectedErr:       mongo.ErrNoDocuments,
+		},
+		{
+			name:              "found a document searching for a date",
+			message:           `{}`,
+			overrideFilterMap: `root.some_date = {"$gte": {"$ts": "2024-01-01T00:00:00Z"}}`,
+			expected:          `{"a":"foo","b":"bar","c":"baz","answer_to_everything":42, "some_date": {"$ts": "2024-01-01T00:00:00Z"}}`,
+		},
+		{
+			name:              "no documents found searching for a date in the past",
+			message:           `{}`,
+			overrideFilterMap: `root.some_date = {"$lt": {"$ts": "2024-01-01T00:00:00Z"}}`,
+			expectedErr:       mongo.ErrNoDocuments,
 		},
 		{
 			name:        "collection interpolation",
@@ -481,6 +527,10 @@ func testMongoDBProcessorFindOne(port string, t *testing.T) {
 	} {
 		if tt.collection != "" {
 			conf.MongoDB.MongoDB.Collection = tt.collection
+		}
+		conf.MongoDB.FilterMap = "root.a = this.a"
+		if tt.overrideFilterMap != "" {
+			conf.MongoDB.FilterMap = tt.overrideFilterMap
 		}
 
 		conf.MongoDB.JSONMarshalMode = tt.marshalMode
